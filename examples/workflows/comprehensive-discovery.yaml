@@ -1,0 +1,358 @@
+apiVersion: sovereign.eye/v1
+kind: Workflow
+metadata:
+  name: comprehensive-discovery
+  namespace: production
+  tenantId: "550e8400-e29b-41d4-a716-446655440000"
+  labels:
+    environment: production
+    criticality: high
+    compliance: "nist-csf-2.0"
+  annotations:
+    description: "Comprehensive asset discovery and vulnerability assessment workflow"
+    author: "security-team@example.com"
+spec:
+  description: |
+    This workflow performs comprehensive asset discovery, port scanning,
+    vulnerability assessment, and attack path analysis for critical infrastructure.
+  
+  schedule:
+    cron: "0 0 * * 0"  # Weekly on Sunday at midnight
+    timezone: "UTC"
+  
+  targets:
+    - type: domain
+      value: "example.com"
+      criticality: critical
+      labels:
+        business-unit: finance
+        data-classification: confidential
+    - type: cidr
+      value: "10.0.0.0/8"
+      criticality: high
+      labels:
+        network: internal
+    - type: asn
+      value: "AS64512"
+      criticality: medium
+  
+  parameters:
+    scanIntensity:
+      type: string
+      default: "medium"
+      description: "Scanning intensity level"
+      validation: "^(light|medium|aggressive)$"
+    enableActiveScanning:
+      type: boolean
+      default: false
+      description: "Enable active vulnerability scanning"
+    maxConcurrentScans:
+      type: number
+      default: 10
+      description: "Maximum concurrent scans per target"
+  
+  secrets:
+    - name: cloud-credentials
+      path: "/secret/data/cloud/aws"
+      key: "credentials"
+    - name: api-keys
+      path: "/secret/data/integrations"
+  
+  rateLimits:
+    perTarget: 100     # requests per second per target
+    perASN: 1000      # requests per second per ASN
+    perWorkflow: 5000 # total requests per second for workflow
+    global: 10000     # global rate limit
+  
+  tasks:
+    # Phase 1: Asset Discovery
+    - name: subdomain-discovery
+      type: scan
+      tool: amass
+      config:
+        passive: true
+        sources:
+          - certspotter
+          - crtsh
+          - threatcrowd
+        resolvers: "/etc/resolvers.txt"
+      outputs:
+        - name: subdomains
+          target: discovered_assets
+      timeout: "30m"
+      retries: 3
+    
+    - name: active-subdomain-enum
+      type: scan
+      tool: subfinder
+      config:
+        threads: 50
+        recursive: true
+      inputs:
+        - name: domains
+          source: parameter
+          value: "targets[?type=='domain'].value"
+      outputs:
+        - name: additional_subdomains
+          target: discovered_assets
+      dependsOn:
+        - subdomain-discovery
+      condition: "parameters.enableActiveScanning == true"
+    
+    # Phase 2: Port Scanning
+    - name: port-scan
+      type: scan
+      tool: naabu
+      fanOut:
+        over: "$.discovered_assets[*]"
+        template:
+          name: "port-scan-{{.item}}"
+          type: scan
+          tool: naabu
+          config:
+            rate: 1000
+            ports: "1-65535"
+            scan-type: "syn"
+            retries: 2
+          timeout: "15m"
+        maxConcurrency: 50
+      dependsOn:
+        - subdomain-discovery
+        - active-subdomain-enum
+    
+    # Phase 3: Service Detection
+    - name: service-detection
+      type: scan
+      tool: nmap
+      config:
+        scripts:
+          - "http-title"
+          - "ssl-cert"
+          - "ssh-hostkey"
+        service-version: true
+      inputs:
+        - name: targets
+          source: task
+          value: "port-scan"
+          jsonPath: "$.results[?(@.status=='open')]"
+      outputs:
+        - name: services
+          target: identified_services
+      dependsOn:
+        - port-scan
+      parallelism: 20
+    
+    # Phase 4: Vulnerability Scanning
+    - name: web-vulnerability-scan
+      type: scan
+      tool: nuclei
+      config:
+        templates:
+          - "cves/"
+          - "vulnerabilities/"
+          - "exposed-panels/"
+          - "misconfiguration/"
+        severity:
+          - critical
+          - high
+          - medium
+        rate-limit: 100
+      inputs:
+        - name: targets
+          source: task
+          value: "service-detection"
+          jsonPath: "$.services[?(@.service=~'http.*')]"
+      outputs:
+        - name: vulnerabilities
+          target: findings
+      approval:
+        required: true
+        role: "SecurityLead"
+        description: "Approval required for active vulnerability scanning"
+        timeout: "1h"
+      dependsOn:
+        - service-detection
+    
+    # Phase 5: Cloud Asset Discovery
+    - name: cloud-asset-discovery
+      type: scan
+      tool: cloud-discovery
+      config:
+        providers:
+          - aws
+          - azure
+          - gcp
+        regions: "all"
+        resource-types:
+          - compute
+          - storage
+          - database
+          - networking
+      inputs:
+        - name: credentials
+          source: secret
+          value: "cloud-credentials"
+      outputs:
+        - name: cloud_assets
+          target: cloud_inventory
+      timeout: "45m"
+    
+    # Phase 6: Attack Path Analysis
+    - name: attack-path-analysis
+      type: analyze
+      tool: graph-analyzer
+      config:
+        algorithms:
+          - shortest-path
+          - privilege-escalation
+          - lateral-movement
+        max-depth: 10
+        target-assets:
+          - "crown-jewels"
+          - "pii-stores"
+      inputs:
+        - name: assets
+          source: task
+          value: "discovered_assets"
+        - name: vulnerabilities
+          source: task
+          value: "web-vulnerability-scan"
+        - name: services
+          source: task
+          value: "service-detection"
+      outputs:
+        - name: attack_paths
+          target: risk_analysis
+      dependsOn:
+        - web-vulnerability-scan
+        - service-detection
+    
+    # Phase 7: Risk Scoring
+    - name: calculate-risk-scores
+      type: analyze
+      tool: risk-engine
+      config:
+        factors:
+          - cvss-score
+          - epss-probability
+          - kev-presence
+          - asset-criticality
+          - exposure-level
+          - exploit-availability
+        frameworks:
+          - "nist-csf-2.0"
+          - "mitre-attack"
+      inputs:
+        - name: findings
+          source: task
+          value: "web-vulnerability-scan"
+        - name: attack_paths
+          source: task
+          value: "attack-path-analysis"
+      outputs:
+        - name: risk_scores
+          target: prioritized_findings
+      dependsOn:
+        - attack-path-analysis
+    
+    # Phase 8: Compliance Mapping
+    - name: compliance-mapping
+      type: analyze
+      tool: compliance-mapper
+      config:
+        frameworks:
+          - id: "nist-csf-2.0"
+            functions:
+              - "govern"
+              - "identify"
+              - "protect"
+          - id: "iso-27001"
+            controls: "all"
+          - id: "cis-controls"
+            version: "8"
+      inputs:
+        - name: findings
+          source: task
+          value: "calculate-risk-scores"
+      outputs:
+        - name: compliance_gaps
+          target: compliance_report
+      dependsOn:
+        - calculate-risk-scores
+    
+    # Phase 9: Remediation (High-Risk Only)
+    - name: auto-remediation
+      type: remediate
+      tool: remediation-engine
+      config:
+        actions:
+          - block-ip
+          - close-port
+          - patch-vulnerability
+          - rotate-credential
+        approval-required: true
+        dry-run: false
+      inputs:
+        - name: targets
+          source: task
+          value: "calculate-risk-scores"
+          jsonPath: "$.findings[?(@.risk_score >= 8)]"
+      approval:
+        required: true
+        role: "SecurityAdmin"
+        approvers:
+          - "ciso@example.com"
+          - "security-lead@example.com"
+        description: "Approval required for automated remediation of high-risk findings"
+        timeout: "2h"
+      dependsOn:
+        - calculate-risk-scores
+      condition: "results['calculate-risk-scores'].high_risk_count > 0"
+    
+    # Phase 10: Reporting
+    - name: generate-report
+      type: notify
+      config:
+        template: "executive-summary"
+        format: "pdf"
+        include:
+          - executive-summary
+          - risk-dashboard
+          - compliance-status
+          - remediation-actions
+          - attack-path-visualization
+      inputs:
+        - name: all_results
+          source: task
+          value: "*"
+      dependsOn:
+        - compliance-mapping
+        - auto-remediation
+  
+  notifications:
+    - type: email
+      condition: always
+      config:
+        to: "security-team@example.com"
+        subject: "Weekly Security Scan Complete - {{.metadata.name}}"
+        template: "scan-complete"
+    
+    - type: slack
+      condition: on_failure
+      config:
+        webhook: "https://hooks.slack.com/services/xxx/yyy/zzz"
+        channel: "#security-alerts"
+        mention: "@security-oncall"
+    
+    - type: webhook
+      condition: on_success
+      config:
+        url: "https://siem.example.com/api/ingest"
+        method: "POST"
+        headers:
+          Authorization: "Bearer {{.secrets.siem_token}}"
+          Content-Type: "application/json"
+  
+  timeout: "6h"
+  maxRetries: 3
+  onFailure: "continue"  # continue, fail-fast, or rollback
